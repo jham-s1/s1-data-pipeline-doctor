@@ -1,0 +1,13 @@
+# Product artifacts — not part of the doctor tool
+observo_installer
+
+# Site-specific values: contains live credentials (siteSpacePassword). Do NOT commit.
+site.yaml
+
+# Backups / editor / OS cruft
+*.bak
+*.swp
+.DS_Store
+INCIDENT-REPORT.md
+customer-network-guide.md
+network-requirements.md
