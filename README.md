@@ -112,14 +112,17 @@ A Docker site is a single container (image `observo-standalone-site`) that runs 
 
 ### Opening source ports
 
-A self-hosted site receives source data on **published container ports** (Syslog, HEC, Kafka, …). Docker can't add a published port to a running container, so option **12** helps you recreate it cleanly:
+A self-hosted site receives source data on **published container ports** (Syslog, HEC, Kafka, …). Docker can't add a published port to a running container, so option **12 → Source ports** opens new ones cleanly:
 
-1. Shows the currently published ports, annotated by likely source type.
-2. You pick a preset (Syslog TCP/TLS/UDP, HEC, Kafka) or a custom `host:container/proto`.
-3. It prints the `-p` flag to add **and** a full recreate command (env passed via a `chmod 600` `--env-file`, so secrets never hit the command line) — or it can recreate the container for you (renames the old one as a backup first, with a one-line rollback).
-4. It prints `ufw` / `firewalld` / `iptables` commands to open the host firewall.
+1. **Shows the currently published ports**, annotated by likely source type.
+2. **Pick a preset** (Syslog TCP/TLS/UDP, HEC, Kafka) or **Custom**, then enter the mapping the way you'd write it for `docker -p` — `10001` or `10001:10001`, with an optional `/tcp`/`/udp` (the container port defaults to the host port).
+3. **Listener status (informational):** it checks whether anything is already listening on that container port and tells you — but never blocks. Opening the port here and configuring the source in the UI can be done **in either order**.
+4. **Apply it two ways:** print the `-p` flag + a full ready-to-run recreate command (env passed via a `chmod 600` `--env-file`, so secrets never hit the command line), **or** have the tool recreate the container for you (it renames the old one as a backup first, with a one-line rollback).
+5. **Firewall hints:** prints `ufw` / `firewalld` / `iptables` commands to open the host firewall for the new port.
 
-> The container-side port must match what the source listens on — that listener is created when you configure the source in the SentinelOne UI. This tool opens the host-side plumbing so traffic can reach the container.
+> The container-side port must match what the source listens on — that listener comes from configuring the source in the SentinelOne UI (e.g. a Syslog source's listen address `0.0.0.0:10001`). This tool opens the host-side plumbing so traffic can reach the container; data flows once both sides are set, in whichever order you do them.
+>
+> **HEC note:** HEC inputs are usually multiplexed over a single endpoint (the existing `8088`) with per-source tokens, so a new HEC source typically reuses `8088` rather than needing a new port. Open a new port when the source defines its own listener (common for Syslog).
 
 ## Auto-Fix Capabilities
 
