@@ -3200,11 +3200,21 @@ docker_menu_source_ports() {
     if [[ -z "$proto" ]]; then
         read -rp "  Protocol [tcp/udp] (default tcp): " proto; proto="${proto:-tcp}"
     fi
-    local hport cport
-    read -rp "  Host port${sugg:+ (default $sugg)}: " hport; hport="${hport:-$sugg}"
-    [[ "$hport" =~ ^[0-9]+$ ]] || { log_err "Invalid host port"; pause; return; }
-    read -rp "  Container port (default $hport — must match the source's listen port): " cport; cport="${cport:-$hport}"
-    [[ "$cport" =~ ^[0-9]+$ ]] || { log_err "Invalid container port"; pause; return; }
+    # One prompt, docker-style. Accepts:  HOST  |  HOST:CONTAINER  |  with optional /tcp|/udp
+    # If only HOST is given, the container port defaults to the same number.
+    local input hport cport
+    echo -e "  ${DIM}Enter the mapping as host[:container] — e.g. ${NC}10001${DIM} or ${NC}10001:10001${DIM} (container port"
+    echo -e "  must match the source's listen port; defaults to the host port).${NC}"
+    read -rp "  Port mapping${sugg:+ (default $sugg)}: " input; input="${input:-$sugg}"
+    input="${input// /}"                                  # tolerate stray spaces
+    if [[ "$input" == */* ]]; then proto="${input##*/}"; input="${input%%/*}"; fi   # optional /proto override
+    if [[ "$input" == *:* ]]; then hport="${input%%:*}"; cport="${input##*:}"; else hport="$input"; cport="$input"; fi
+    if ! [[ "$hport" =~ ^[0-9]+$ && "$cport" =~ ^[0-9]+$ ]]; then
+        log_err "Invalid mapping '$input' — use host or host:container (e.g. 10001 or 10001:10001)"; pause; return
+    fi
+    if ! [[ "$proto" =~ ^(tcp|udp)$ ]]; then
+        log_err "Invalid protocol '$proto' — use tcp or udp"; pause; return
+    fi
 
     local newmap="${hport}:${cport}/${proto}"
     echo ""
