@@ -3122,6 +3122,33 @@ _dp_firewall_hints() {
     echo "    iptables:  sudo iptables -A INPUT -p ${proto} --dport ${port} -j ACCEPT"
 }
 
+# Informational only: report whether the container is already set up to receive
+# traffic on a container port. NEVER blocks — publishing the host port and
+# configuring the source in the UI can happen in either order.
+_dp_listener_status() {
+    local cport="$1" proto="$2" hexport listening cfg
+    hexport=$(printf '%04X' "$cport" 2>/dev/null)
+    # Runtime: is a socket listening/bound on this port inside the container?
+    if [[ -n "$hexport" ]]; then
+        listening=$(dexec sh -c "cat /proc/net/${proto} /proc/net/${proto}6 2>/dev/null" 2>/dev/null \
+            | awk -v port="$hexport" -v proto="$proto" 'NR>1 { split($2,a,":");
+                  if (toupper(a[2])==port) { if (proto=="tcp" && $4=="0A"){print "y";exit} if (proto=="udp"){print "y";exit} } }')
+    fi
+    # Config: is a source declared to listen on this port? (e.g. address: 0.0.0.0:8088)
+    cfg=$(dexec sh -c "cat /etc/dataplane/config.yaml /etc/collector/config.yaml 2>/dev/null" 2>/dev/null \
+        | grep -E '^[[:space:]]*address:' | grep -cE ":${cport}([^0-9]|\$)" 2>/dev/null)
+
+    if [[ -n "$listening" ]]; then
+        log_ok "A service is already listening on container port ${cport}/${proto} — publishing it will connect traffic through."
+    elif [[ "${cfg:-0}" -gt 0 ]]; then
+        log_ok "A source is configured for container port ${cport} in the dataplane config (listener should be up)."
+    else
+        log_info "Nothing is listening on container port ${cport}/${proto} yet — that's expected if you haven't"
+        echo -e "    ${DIM}configured the source in the UI. Order doesn't matter: open the port here and configure${NC}"
+        echo -e "    ${DIM}the source (set its listen address to :${cport}) in either order — data flows once both are done.${NC}"
+    fi
+}
+
 # Reconstruct the `docker run` argv for the current container, adding extra -p
 # mappings ($@). Sets globals DP_RUN_CMD (array) and DP_ENV_FILE. Env is written
 # to a 0600 --env-file (HOSTNAME dropped so Docker assigns a fresh one) — secrets
@@ -3219,9 +3246,7 @@ docker_menu_source_ports() {
     local newmap="${hport}:${cport}/${proto}"
     echo ""
     log_info "New mapping: -p ${newmap}"
-    echo -e "  ${DIM}Note: the container must listen on ${cport}/${proto}. That listener is created${NC}"
-    echo -e "  ${DIM}when you configure the source in the SentinelOne UI — this tool only opens${NC}"
-    echo -e "  ${DIM}the host-side port so traffic can reach the container.${NC}"
+    _dp_listener_status "$cport" "$proto"
     echo ""
     _dp_firewall_hints "$hport" "$proto"
     echo ""
