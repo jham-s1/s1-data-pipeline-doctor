@@ -2138,6 +2138,161 @@ fix_connectivity() {
 #   dataplane, control-agent, collector, pattern-extractor, monitor.
 # Endpoints come from container env (AUTH_DOMAIN_URL etc), not hardcoded.
 
+docker_setup_new_site() {
+    banner "New Site Setup"
+    echo
+    log_info "No Data Pipeline container is running. Let's set one up."
+    echo
+    echo "  Step 1 — Get your site credentials from SentinelOne:"
+    echo
+    echo "    1. Log in to SentinelOne"
+    echo "    2. Navigate to: Account → Data Pipelines → Pipeline Manager"
+    echo "    3. Select: Sites → Add Site → Self Hosted"
+    echo "    4. Choose your scope"
+    echo "    5. The console will generate a .env file — download it"
+    echo
+    echo "  Copy that file to:"
+    echo -e "    ${CYAN}~/ai-data-pipelines.env${NC}"
+    echo
+    echo "  Waiting for ~/ai-data-pipelines.env...  (Ctrl-C to abort)"
+    echo
+
+    local env_file="$HOME/ai-data-pipelines.env"
+    if [[ ! -f "$env_file" ]]; then
+        echo -n "  Checking"
+        while [[ ! -f "$env_file" ]]; do
+            echo -n "."; sleep 3
+        done
+        echo
+    fi
+    log_ok "Found ~/ai-data-pipelines.env"
+    chmod 600 "$env_file"
+    echo
+
+    # Parse credentials from comment header — the .env file embeds docker login details
+    # in a comment line like:   docker login -u AWS -p 'eyJw...' 822434346939.dkr.ecr.us-east-1.amazonaws.com
+    local login_line registry token
+    login_line=$(grep -m1 'docker login' "$env_file") || {
+        log_err "Could not find 'docker login' line in ~/ai-data-pipelines.env"; return 1
+    }
+    registry=$(awk '{print $NF}' <<< "$login_line") || {
+        log_err "Could not parse ECR registry from $env_file"; return 1
+    }
+    token=$(sed "s/.*-p '\\([^']*\\)'.*/\\1/" <<< "$login_line") || {
+        log_err "Could not parse ECR token from $env_file"; return 1
+    }
+
+    # Parse image URI from comment header (looks like: 822434346939.dkr.ecr.us-east-1.amazonaws.com/observo-standalone-site:2.26.3)
+    local image
+    image=$(grep -oE '[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-zA-Z0-9/_-]+:[0-9.]+' "$env_file" | head -1) || {
+        log_err "Could not find ECR image URI in ~/ai-data-pipelines.env"; return 1
+    }
+    echo
+
+    # Step 2: Docker login
+    echo "  Step 2 — Authenticating with container registry..."
+    if docker login -u AWS --password-stdin "$registry" <<< "$token" >/dev/null 2>&1; then
+        log_ok "Registry login successful"
+    else
+        log_err "Docker login failed — verify ~/ai-data-pipelines.env is correct"
+        return 1
+    fi
+    echo
+
+    # Step 3: Ask about ports (optional)
+    local port_specs=()
+    echo "  Step 3 — Configure source listener ports (optional)"
+    if confirm "Add source listener ports now?"; then
+        while true; do
+            echo
+            echo "    Port mapping presets:"
+            echo "      1) Syslog TCP (514:10514)"
+            echo "      2) Syslog TLS (514:10514/tls)"
+            echo "      3) Syslog UDP (514:10514/udp)"
+            echo "      4) HEC push (8088:8088)"
+            echo "      5) Kafka (9092:9092)"
+            echo "      6) Custom"
+            echo "      0) Skip ports"
+            echo
+            local port_choice
+            read -rp "    Choose [0-6]: " port_choice
+            [[ "$port_choice" == "0" ]] && break
+
+            local port_spec
+            case "$port_choice" in
+                1) port_spec="514:10514" ;;
+                2) port_spec="514:10514" ;;  # TLS handled by container config
+                3) port_spec="514:10514/udp" ;;
+                4) port_spec="8088:8088" ;;
+                5) port_spec="9092:9092" ;;
+                6)
+                    read -rp "    Enter port mapping (host:container[/proto]): " port_spec
+                    [[ -z "$port_spec" ]] && continue
+                    ;;
+                *) log_warn "Invalid choice"; continue ;;
+            esac
+
+            port_specs+=("$port_spec")
+            log_ok "Added: $port_spec"
+        done
+    fi
+    echo
+
+    # Step 4: Run container
+    echo "  Step 4 — Starting the Data Pipeline container..."
+    local docker_flags=()
+    for spec in "${port_specs[@]}"; do
+        docker_flags+=("-p" "$spec")
+    done
+    if docker run -d \
+        --name observo-standalone-site \
+        --env-file "$env_file" \
+        --tmpfs /etc/secrets:uid=1000,gid=1000,mode=0700 \
+        -v observo-data:/var/observo/data \
+        "${docker_flags[@]}" \
+        "$image" >/dev/null 2>&1; then
+        log_ok "Container started: observo-standalone-site"
+    else
+        log_err "Failed to start container. Check: docker logs observo-standalone-site"
+        return 1
+    fi
+    echo
+
+    # Step 5: Offer Docker Compose
+    if confirm "Create a docker-compose.yml for easier management?"; then
+        local compose_file="$HOME/docker-compose-observo.yml"
+        cat > "$compose_file" <<COMPOSE
+services:
+  observo-standalone-site:
+    image: $image
+    container_name: observo-standalone-site
+    env_file: ~/ai-data-pipelines.env
+    tmpfs:
+      - /etc/secrets:uid=1000,gid=1000,mode=0700
+    volumes:
+      - observo-data:/var/observo/data
+COMPOSE
+        if [[ ${#port_specs[@]} -gt 0 ]]; then
+            echo "    ports:" >> "$compose_file"
+            for spec in "${port_specs[@]}"; do
+                echo "      - \"$spec\"" >> "$compose_file"
+            done
+        fi
+        cat >> "$compose_file" <<COMPOSE
+    restart: unless-stopped
+
+volumes:
+  observo-data:
+COMPOSE
+        log_ok "Created: $compose_file"
+        echo -e "          Run with: ${CYAN}docker compose -f $compose_file up -d${NC}"
+    fi
+    echo
+
+    DOCKER_CONTAINER="observo-standalone-site"
+    return 0
+}
+
 # --- small helpers ---
 _in_list() { local needle="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$needle" ]] && return 0; done; return 1; }
 
@@ -2185,10 +2340,7 @@ docker_preflight() {
         while IFS= read -r m; do [[ -n "$m" ]] && arr+=("$m"); done <<< "$matches"
 
         if [[ ${#arr[@]} -eq 0 ]]; then
-            log_err "No running container matching image '*$DOCKER_IMAGE_MATCH*' found"
-            echo "  Running containers:"
-            docker ps --format '    {{.Names}}  ({{.Image}})'
-            read -rp "  Enter container name to manage (or Ctrl-C to quit): " DOCKER_CONTAINER
+            docker_setup_new_site || exit 1
         elif [[ ${#arr[@]} -eq 1 ]]; then
             DOCKER_CONTAINER="${arr[0]}"
         else
