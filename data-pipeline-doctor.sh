@@ -24,6 +24,11 @@ GATEWAY_TLS_SECURED=""                           # from container env
 API_GATEWAY_ENDPOINT_VAL=""                       # manager/gateway endpoint (from container env)
 PIPELINE_NAME_MAP=()                               # "entityid|Human Name" entries (bash 3.2-safe; no assoc arrays)
 
+# --- Host OS discovery (for the Docker install guide) ---
+DPD_OS_FAMILY=""                                   # mac|windows|wsl|debian|rhel|amazon|unknown
+DPD_OS_ID=""                                       # /etc/os-release ID (ubuntu, rocky, amzn, ...)
+DPD_OS_VER=""                                      # /etc/os-release VERSION_ID
+
 # --- Colors & formatting ---
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; PURPLE='\033[1;35m'
@@ -2320,18 +2325,186 @@ url_to_hostport() {
 }
 
 # ============================================================
+#  Docker install guide (OS discovery + guided engine install)
+# ============================================================
+# Reached from docker_preflight when the docker binary is missing.
+# On Linux we detect the distro family and (after confirmation) run the
+# official install steps; on Mac/Windows/WSL we point at Docker Desktop.
+# Setting DPD_INSTALL_TEST=1 runs the package-install steps only and skips
+# the systemctl / usermod tail so the functions are testable in a plain
+# (non-systemd, unprivileged) container.
+
+_dpd_sudo() { [[ ${EUID:-$(id -u)} -eq 0 ]] && echo "" || echo "sudo"; }
+
+# Detect the host OS into DPD_OS_FAMILY / DPD_OS_ID / DPD_OS_VER.
+_dpd_detect_os() {
+    DPD_OS_FAMILY=""; DPD_OS_ID=""; DPD_OS_VER=""
+    case "$(uname -s)" in
+        Darwin)                DPD_OS_FAMILY="mac"; return ;;
+        MINGW*|MSYS*|CYGWIN*)  DPD_OS_FAMILY="windows"; return ;;
+    esac
+    if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+        DPD_OS_FAMILY="wsl"; return
+    fi
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        DPD_OS_ID="${ID:-}"; DPD_OS_VER="${VERSION_ID:-}"
+        case "${ID:-}" in
+            amzn)                         DPD_OS_FAMILY="amazon" ;;
+            ubuntu|debian)                DPD_OS_FAMILY="debian" ;;
+            rhel|centos|rocky|almalinux)  DPD_OS_FAMILY="rhel" ;;
+            *)
+                case " ${ID_LIKE:-} " in
+                    *debian*)                  DPD_OS_FAMILY="debian" ;;
+                    *rhel*|*fedora*|*centos*)  DPD_OS_FAMILY="rhel" ;;
+                    *)                         DPD_OS_FAMILY="unknown" ;;
+                esac ;;
+        esac
+    else
+        DPD_OS_FAMILY="unknown"
+    fi
+}
+
+# Echo a command, then run it (unless DPD_INSTALL_TEST set the caller to skip).
+_dpd_run() {
+    echo -e "    ${DIM}\$ $*${NC}"
+    "$@"
+}
+
+dpd_install_debian() {
+    local SUDO repo_url codename arch
+    SUDO="$(_dpd_sudo)"
+    [[ "$DPD_OS_ID" == "debian" ]] && repo_url="https://download.docker.com/linux/debian" \
+                                   || repo_url="https://download.docker.com/linux/ubuntu"
+    echo "  Installing Docker Engine from Docker's official apt repository..."
+    echo
+    _dpd_run $SUDO apt-get update -y || return 1
+    _dpd_run $SUDO apt-get install -y ca-certificates curl || return 1
+    _dpd_run $SUDO install -m 0755 -d /etc/apt/keyrings || return 1
+    _dpd_run $SUDO curl -fsSL "$repo_url/gpg" -o /etc/apt/keyrings/docker.asc || return 1
+    _dpd_run $SUDO chmod a+r /etc/apt/keyrings/docker.asc || return 1
+    arch="$(dpkg --print-architecture)"
+    codename="$( . /etc/os-release && echo "${VERSION_CODENAME:-}" )"
+    echo "deb [arch=$arch signed-by=/etc/apt/keyrings/docker.asc] $repo_url $codename stable" \
+        | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null || return 1
+    _dpd_run $SUDO apt-get update -y || return 1
+    _dpd_run $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin || return 1
+    _dpd_post_install
+}
+
+dpd_install_rhel() {
+    local SUDO
+    SUDO="$(_dpd_sudo)"
+    echo "  Installing Docker Engine from Docker's official dnf repository..."
+    echo
+    _dpd_run $SUDO dnf -y install dnf-plugins-core || return 1
+    # dnf5 (config-manager addrepo) vs dnf4 (config-manager --add-repo)
+    if $SUDO dnf config-manager --help 2>&1 | grep -q -- '--add-repo'; then
+        _dpd_run $SUDO dnf config-manager --add-repo \
+            https://download.docker.com/linux/centos/docker-ce.repo || return 1
+    else
+        _dpd_run $SUDO dnf config-manager addrepo --from-repofile \
+            https://download.docker.com/linux/centos/docker-ce.repo || return 1
+    fi
+    _dpd_run $SUDO dnf install -y docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin || return 1
+    _dpd_post_install
+}
+
+dpd_install_amazon() {
+    local SUDO
+    SUDO="$(_dpd_sudo)"
+    echo "  Installing Docker from the Amazon Linux repositories..."
+    echo
+    if [[ "$DPD_OS_VER" == 2* && "$DPD_OS_VER" != "2023" ]]; then
+        # Amazon Linux 2 — docker ships via amazon-linux-extras
+        if command -v amazon-linux-extras >/dev/null 2>&1; then
+            _dpd_run $SUDO amazon-linux-extras install -y docker || return 1
+        else
+            _dpd_run $SUDO yum install -y docker || return 1
+        fi
+    else
+        # Amazon Linux 2023 (and newer) — dnf
+        _dpd_run $SUDO dnf install -y docker || return 1
+    fi
+    _dpd_post_install
+}
+
+# Enable + start the daemon and add the user to the docker group.
+# Skipped under DPD_INSTALL_TEST (no systemd / unprivileged container).
+_dpd_post_install() {
+    if [[ -n "${DPD_INSTALL_TEST:-}" ]]; then
+        log_info "Test mode: skipping 'systemctl enable --now docker' and group setup."
+        return 0
+    fi
+    local SUDO; SUDO="$(_dpd_sudo)"
+    echo
+    _dpd_run $SUDO systemctl enable --now docker || \
+        log_warn "Could not start docker via systemctl — start it manually."
+    local target_user="${SUDO_USER:-$USER}"
+    if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+        _dpd_run $SUDO usermod -aG docker "$target_user" || true
+        log_warn "Added '$target_user' to the 'docker' group — log out/in for it to take effect."
+    fi
+    log_ok "Docker Engine installed."
+}
+
+docker_install_guide() {
+    banner
+    _dpd_detect_os
+    log_info "Detected OS: ${DPD_OS_ID:-$(uname -s)} ${DPD_OS_VER:-} (family: ${DPD_OS_FAMILY:-unknown})"
+    echo
+    case "$DPD_OS_FAMILY" in
+        mac)
+            echo "  Docker on macOS ships as Docker Desktop. Install it from:"
+            echo -e "    ${CYAN}https://docs.docker.com/desktop/setup/install/mac-install/${NC}"
+            echo
+            if command -v open >/dev/null 2>&1 && confirm "Open the download page now?"; then
+                open "https://docs.docker.com/desktop/setup/install/mac-install/" >/dev/null 2>&1 || true
+            fi
+            echo "  After installing & starting Docker Desktop, re-run this tool."
+            return 1 ;;
+        windows|wsl)
+            echo "  Docker on Windows ships as Docker Desktop (with WSL 2 integration). Install it from:"
+            echo -e "    ${CYAN}https://docs.docker.com/desktop/setup/install/windows-install/${NC}"
+            echo
+            echo "  After installing & starting Docker Desktop, re-run this tool."
+            return 1 ;;
+        debian) confirm "Install Docker Engine now (apt)?" && dpd_install_debian ;;
+        rhel)   confirm "Install Docker Engine now (dnf)?" && dpd_install_rhel ;;
+        amazon) confirm "Install Docker Engine now?"       && dpd_install_amazon ;;
+        *)
+            log_err "Could not auto-detect a supported OS for automatic install."
+            echo "  See Docker's install docs: ${CYAN}https://docs.docker.com/engine/install/${NC}"
+            return 1 ;;
+    esac
+}
+
+# ============================================================
 #  Docker preflight & endpoint discovery
 # ============================================================
 docker_preflight() {
     if ! command -v docker >/dev/null 2>&1; then
-        log_err "docker binary not found in PATH"; exit 1
+        log_warn "Docker is not installed on this host."
+        docker_install_guide || exit 1
+        if ! command -v docker >/dev/null 2>&1; then
+            log_err "Docker still not found. Re-run this tool after installing Docker."
+            exit 1
+        fi
     fi
     if ! docker info >/dev/null 2>&1; then
-        log_err "Cannot talk to the Docker daemon."
-        echo "  Is Docker running? You may need to run as root or join the 'docker' group:"
-        echo "    sudo usermod -aG docker \$USER   # then log out/in"
-        echo "  Or re-run this tool with sudo."
-        exit 1
+        log_warn "Docker is installed but the daemon isn't reachable."
+        if [[ "$(uname -s)" == "Linux" ]] && confirm "Try to start the Docker daemon now?"; then
+            $(_dpd_sudo) systemctl enable --now docker >/dev/null 2>&1 || true
+        fi
+        if ! docker info >/dev/null 2>&1; then
+            echo "  Is Docker running? You may need to run as root or join the 'docker' group:"
+            echo "    sudo usermod -aG docker \$USER   # then log out/in"
+            echo "  Or re-run this tool with sudo."
+            exit 1
+        fi
     fi
 
     if [[ -z "$DOCKER_CONTAINER" ]]; then
@@ -3492,10 +3665,14 @@ docker_main_menu() {
 # ============================================================
 #  Entry point
 # ============================================================
-parse_args "$@"
-preflight
-if [[ "$SITE_TYPE" == "docker" ]]; then
-    docker_main_menu
-else
-    main_menu
+# Guarded so the script can be sourced as a library (e.g. by the test
+# harness in tests/) without launching the interactive menu.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+    parse_args "$@"
+    preflight
+    if [[ "$SITE_TYPE" == "docker" ]]; then
+        docker_main_menu
+    else
+        main_menu
+    fi
 fi
