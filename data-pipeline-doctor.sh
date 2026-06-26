@@ -24,6 +24,11 @@ GATEWAY_TLS_SECURED=""                           # from container env
 API_GATEWAY_ENDPOINT_VAL=""                       # manager/gateway endpoint (from container env)
 PIPELINE_NAME_MAP=()                               # "entityid|Human Name" entries (bash 3.2-safe; no assoc arrays)
 
+# --- Host OS discovery (for the Docker install guide) ---
+DPD_OS_FAMILY=""                                   # mac|windows|wsl|debian|rhel|amazon|unknown
+DPD_OS_ID=""                                       # /etc/os-release ID (ubuntu, rocky, amzn, ...)
+DPD_OS_VER=""                                      # /etc/os-release VERSION_ID
+
 # --- Colors & formatting ---
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; PURPLE='\033[1;35m'
@@ -2138,6 +2143,161 @@ fix_connectivity() {
 #   dataplane, control-agent, collector, pattern-extractor, monitor.
 # Endpoints come from container env (AUTH_DOMAIN_URL etc), not hardcoded.
 
+docker_setup_new_site() {
+    banner "New Site Setup"
+    echo
+    log_info "No Data Pipeline container is running. Let's set one up."
+    echo
+    echo "  Step 1 — Get your site credentials from SentinelOne:"
+    echo
+    echo "    1. Log in to SentinelOne"
+    echo "    2. Navigate to: Account → Data Pipelines → Pipeline Manager"
+    echo "    3. Select: Sites → Add Site → Self Hosted"
+    echo "    4. Choose your scope"
+    echo "    5. The console will generate a .env file — download it"
+    echo
+    echo "  Copy that file to:"
+    echo -e "    ${CYAN}~/ai-data-pipelines.env${NC}"
+    echo
+    echo "  Waiting for ~/ai-data-pipelines.env...  (Ctrl-C to abort)"
+    echo
+
+    local env_file="$HOME/ai-data-pipelines.env"
+    if [[ ! -f "$env_file" ]]; then
+        echo -n "  Checking"
+        while [[ ! -f "$env_file" ]]; do
+            echo -n "."; sleep 3
+        done
+        echo
+    fi
+    log_ok "Found ~/ai-data-pipelines.env"
+    chmod 600 "$env_file"
+    echo
+
+    # Parse credentials from comment header — the .env file embeds docker login details
+    # in a comment line like:   docker login -u AWS -p 'eyJw...' 822434346939.dkr.ecr.us-east-1.amazonaws.com
+    local login_line registry token
+    login_line=$(grep -m1 'docker login' "$env_file") || {
+        log_err "Could not find 'docker login' line in ~/ai-data-pipelines.env"; return 1
+    }
+    registry=$(awk '{print $NF}' <<< "$login_line") || {
+        log_err "Could not parse ECR registry from $env_file"; return 1
+    }
+    token=$(sed "s/.*-p '\\([^']*\\)'.*/\\1/" <<< "$login_line") || {
+        log_err "Could not parse ECR token from $env_file"; return 1
+    }
+
+    # Parse image URI from comment header (looks like: 822434346939.dkr.ecr.us-east-1.amazonaws.com/observo-standalone-site:2.26.3)
+    local image
+    image=$(grep -oE '[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-zA-Z0-9/_-]+:[0-9.]+' "$env_file" | head -1) || {
+        log_err "Could not find ECR image URI in ~/ai-data-pipelines.env"; return 1
+    }
+    echo
+
+    # Step 2: Docker login
+    echo "  Step 2 — Authenticating with container registry..."
+    if docker login -u AWS --password-stdin "$registry" <<< "$token" >/dev/null 2>&1; then
+        log_ok "Registry login successful"
+    else
+        log_err "Docker login failed — verify ~/ai-data-pipelines.env is correct"
+        return 1
+    fi
+    echo
+
+    # Step 3: Ask about ports (optional)
+    local port_specs=()
+    echo "  Step 3 — Configure source listener ports (optional)"
+    if confirm "Add source listener ports now?"; then
+        while true; do
+            echo
+            echo "    Port mapping presets:"
+            echo "      1) Syslog TCP (514:10514)"
+            echo "      2) Syslog TLS (514:10514/tls)"
+            echo "      3) Syslog UDP (514:10514/udp)"
+            echo "      4) HEC push (8088:8088)"
+            echo "      5) Kafka (9092:9092)"
+            echo "      6) Custom"
+            echo "      0) Skip ports"
+            echo
+            local port_choice
+            read -rp "    Choose [0-6]: " port_choice
+            [[ "$port_choice" == "0" ]] && break
+
+            local port_spec
+            case "$port_choice" in
+                1) port_spec="514:10514" ;;
+                2) port_spec="514:10514" ;;  # TLS handled by container config
+                3) port_spec="514:10514/udp" ;;
+                4) port_spec="8088:8088" ;;
+                5) port_spec="9092:9092" ;;
+                6)
+                    read -rp "    Enter port mapping (host:container[/proto]): " port_spec
+                    [[ -z "$port_spec" ]] && continue
+                    ;;
+                *) log_warn "Invalid choice"; continue ;;
+            esac
+
+            port_specs+=("$port_spec")
+            log_ok "Added: $port_spec"
+        done
+    fi
+    echo
+
+    # Step 4: Run container
+    echo "  Step 4 — Starting the Data Pipeline container..."
+    local docker_flags=()
+    for spec in "${port_specs[@]}"; do
+        docker_flags+=("-p" "$spec")
+    done
+    if docker run -d \
+        --name observo-standalone-site \
+        --env-file "$env_file" \
+        --tmpfs /etc/secrets:uid=1000,gid=1000,mode=0700 \
+        -v observo-data:/var/observo/data \
+        "${docker_flags[@]}" \
+        "$image" >/dev/null 2>&1; then
+        log_ok "Container started: observo-standalone-site"
+    else
+        log_err "Failed to start container. Check: docker logs observo-standalone-site"
+        return 1
+    fi
+    echo
+
+    # Step 5: Offer Docker Compose
+    if confirm "Create a docker-compose.yml for easier management?"; then
+        local compose_file="$HOME/docker-compose-observo.yml"
+        cat > "$compose_file" <<COMPOSE
+services:
+  observo-standalone-site:
+    image: $image
+    container_name: observo-standalone-site
+    env_file: ~/ai-data-pipelines.env
+    tmpfs:
+      - /etc/secrets:uid=1000,gid=1000,mode=0700
+    volumes:
+      - observo-data:/var/observo/data
+COMPOSE
+        if [[ ${#port_specs[@]} -gt 0 ]]; then
+            echo "    ports:" >> "$compose_file"
+            for spec in "${port_specs[@]}"; do
+                echo "      - \"$spec\"" >> "$compose_file"
+            done
+        fi
+        cat >> "$compose_file" <<COMPOSE
+    restart: unless-stopped
+
+volumes:
+  observo-data:
+COMPOSE
+        log_ok "Created: $compose_file"
+        echo -e "          Run with: ${CYAN}docker compose -f $compose_file up -d${NC}"
+    fi
+    echo
+
+    DOCKER_CONTAINER="observo-standalone-site"
+    return 0
+}
+
 # --- small helpers ---
 _in_list() { local needle="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$needle" ]] && return 0; done; return 1; }
 
@@ -2165,18 +2325,186 @@ url_to_hostport() {
 }
 
 # ============================================================
+#  Docker install guide (OS discovery + guided engine install)
+# ============================================================
+# Reached from docker_preflight when the docker binary is missing.
+# On Linux we detect the distro family and (after confirmation) run the
+# official install steps; on Mac/Windows/WSL we point at Docker Desktop.
+# Setting DPD_INSTALL_TEST=1 runs the package-install steps only and skips
+# the systemctl / usermod tail so the functions are testable in a plain
+# (non-systemd, unprivileged) container.
+
+_dpd_sudo() { [[ ${EUID:-$(id -u)} -eq 0 ]] && echo "" || echo "sudo"; }
+
+# Detect the host OS into DPD_OS_FAMILY / DPD_OS_ID / DPD_OS_VER.
+_dpd_detect_os() {
+    DPD_OS_FAMILY=""; DPD_OS_ID=""; DPD_OS_VER=""
+    case "$(uname -s)" in
+        Darwin)                DPD_OS_FAMILY="mac"; return ;;
+        MINGW*|MSYS*|CYGWIN*)  DPD_OS_FAMILY="windows"; return ;;
+    esac
+    if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+        DPD_OS_FAMILY="wsl"; return
+    fi
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        DPD_OS_ID="${ID:-}"; DPD_OS_VER="${VERSION_ID:-}"
+        case "${ID:-}" in
+            amzn)                         DPD_OS_FAMILY="amazon" ;;
+            ubuntu|debian)                DPD_OS_FAMILY="debian" ;;
+            rhel|centos|rocky|almalinux)  DPD_OS_FAMILY="rhel" ;;
+            *)
+                case " ${ID_LIKE:-} " in
+                    *debian*)                  DPD_OS_FAMILY="debian" ;;
+                    *rhel*|*fedora*|*centos*)  DPD_OS_FAMILY="rhel" ;;
+                    *)                         DPD_OS_FAMILY="unknown" ;;
+                esac ;;
+        esac
+    else
+        DPD_OS_FAMILY="unknown"
+    fi
+}
+
+# Echo a command, then run it (unless DPD_INSTALL_TEST set the caller to skip).
+_dpd_run() {
+    echo -e "    ${DIM}\$ $*${NC}"
+    "$@"
+}
+
+dpd_install_debian() {
+    local SUDO repo_url codename arch
+    SUDO="$(_dpd_sudo)"
+    [[ "$DPD_OS_ID" == "debian" ]] && repo_url="https://download.docker.com/linux/debian" \
+                                   || repo_url="https://download.docker.com/linux/ubuntu"
+    echo "  Installing Docker Engine from Docker's official apt repository..."
+    echo
+    _dpd_run $SUDO apt-get update -y || return 1
+    _dpd_run $SUDO apt-get install -y ca-certificates curl || return 1
+    _dpd_run $SUDO install -m 0755 -d /etc/apt/keyrings || return 1
+    _dpd_run $SUDO curl -fsSL "$repo_url/gpg" -o /etc/apt/keyrings/docker.asc || return 1
+    _dpd_run $SUDO chmod a+r /etc/apt/keyrings/docker.asc || return 1
+    arch="$(dpkg --print-architecture)"
+    codename="$( . /etc/os-release && echo "${VERSION_CODENAME:-}" )"
+    echo "deb [arch=$arch signed-by=/etc/apt/keyrings/docker.asc] $repo_url $codename stable" \
+        | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null || return 1
+    _dpd_run $SUDO apt-get update -y || return 1
+    _dpd_run $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin || return 1
+    _dpd_post_install
+}
+
+dpd_install_rhel() {
+    local SUDO
+    SUDO="$(_dpd_sudo)"
+    echo "  Installing Docker Engine from Docker's official dnf repository..."
+    echo
+    _dpd_run $SUDO dnf -y install dnf-plugins-core || return 1
+    # dnf5 (config-manager addrepo) vs dnf4 (config-manager --add-repo)
+    if $SUDO dnf config-manager --help 2>&1 | grep -q -- '--add-repo'; then
+        _dpd_run $SUDO dnf config-manager --add-repo \
+            https://download.docker.com/linux/centos/docker-ce.repo || return 1
+    else
+        _dpd_run $SUDO dnf config-manager addrepo --from-repofile \
+            https://download.docker.com/linux/centos/docker-ce.repo || return 1
+    fi
+    _dpd_run $SUDO dnf install -y docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin || return 1
+    _dpd_post_install
+}
+
+dpd_install_amazon() {
+    local SUDO
+    SUDO="$(_dpd_sudo)"
+    echo "  Installing Docker from the Amazon Linux repositories..."
+    echo
+    if [[ "$DPD_OS_VER" == 2* && "$DPD_OS_VER" != "2023" ]]; then
+        # Amazon Linux 2 — docker ships via amazon-linux-extras
+        if command -v amazon-linux-extras >/dev/null 2>&1; then
+            _dpd_run $SUDO amazon-linux-extras install -y docker || return 1
+        else
+            _dpd_run $SUDO yum install -y docker || return 1
+        fi
+    else
+        # Amazon Linux 2023 (and newer) — dnf
+        _dpd_run $SUDO dnf install -y docker || return 1
+    fi
+    _dpd_post_install
+}
+
+# Enable + start the daemon and add the user to the docker group.
+# Skipped under DPD_INSTALL_TEST (no systemd / unprivileged container).
+_dpd_post_install() {
+    if [[ -n "${DPD_INSTALL_TEST:-}" ]]; then
+        log_info "Test mode: skipping 'systemctl enable --now docker' and group setup."
+        return 0
+    fi
+    local SUDO; SUDO="$(_dpd_sudo)"
+    echo
+    _dpd_run $SUDO systemctl enable --now docker || \
+        log_warn "Could not start docker via systemctl — start it manually."
+    local target_user="${SUDO_USER:-$USER}"
+    if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+        _dpd_run $SUDO usermod -aG docker "$target_user" || true
+        log_warn "Added '$target_user' to the 'docker' group — log out/in for it to take effect."
+    fi
+    log_ok "Docker Engine installed."
+}
+
+docker_install_guide() {
+    banner
+    _dpd_detect_os
+    log_info "Detected OS: ${DPD_OS_ID:-$(uname -s)} ${DPD_OS_VER:-} (family: ${DPD_OS_FAMILY:-unknown})"
+    echo
+    case "$DPD_OS_FAMILY" in
+        mac)
+            echo "  Docker on macOS ships as Docker Desktop. Install it from:"
+            echo -e "    ${CYAN}https://docs.docker.com/desktop/setup/install/mac-install/${NC}"
+            echo
+            if command -v open >/dev/null 2>&1 && confirm "Open the download page now?"; then
+                open "https://docs.docker.com/desktop/setup/install/mac-install/" >/dev/null 2>&1 || true
+            fi
+            echo "  After installing & starting Docker Desktop, re-run this tool."
+            return 1 ;;
+        windows|wsl)
+            echo "  Docker on Windows ships as Docker Desktop (with WSL 2 integration). Install it from:"
+            echo -e "    ${CYAN}https://docs.docker.com/desktop/setup/install/windows-install/${NC}"
+            echo
+            echo "  After installing & starting Docker Desktop, re-run this tool."
+            return 1 ;;
+        debian) confirm "Install Docker Engine now (apt)?" && dpd_install_debian ;;
+        rhel)   confirm "Install Docker Engine now (dnf)?" && dpd_install_rhel ;;
+        amazon) confirm "Install Docker Engine now?"       && dpd_install_amazon ;;
+        *)
+            log_err "Could not auto-detect a supported OS for automatic install."
+            echo "  See Docker's install docs: ${CYAN}https://docs.docker.com/engine/install/${NC}"
+            return 1 ;;
+    esac
+}
+
+# ============================================================
 #  Docker preflight & endpoint discovery
 # ============================================================
 docker_preflight() {
     if ! command -v docker >/dev/null 2>&1; then
-        log_err "docker binary not found in PATH"; exit 1
+        log_warn "Docker is not installed on this host."
+        docker_install_guide || exit 1
+        if ! command -v docker >/dev/null 2>&1; then
+            log_err "Docker still not found. Re-run this tool after installing Docker."
+            exit 1
+        fi
     fi
     if ! docker info >/dev/null 2>&1; then
-        log_err "Cannot talk to the Docker daemon."
-        echo "  Is Docker running? You may need to run as root or join the 'docker' group:"
-        echo "    sudo usermod -aG docker \$USER   # then log out/in"
-        echo "  Or re-run this tool with sudo."
-        exit 1
+        log_warn "Docker is installed but the daemon isn't reachable."
+        if [[ "$(uname -s)" == "Linux" ]] && confirm "Try to start the Docker daemon now?"; then
+            $(_dpd_sudo) systemctl enable --now docker >/dev/null 2>&1 || true
+        fi
+        if ! docker info >/dev/null 2>&1; then
+            echo "  Is Docker running? You may need to run as root or join the 'docker' group:"
+            echo "    sudo usermod -aG docker \$USER   # then log out/in"
+            echo "  Or re-run this tool with sudo."
+            exit 1
+        fi
     fi
 
     if [[ -z "$DOCKER_CONTAINER" ]]; then
@@ -2185,10 +2513,7 @@ docker_preflight() {
         while IFS= read -r m; do [[ -n "$m" ]] && arr+=("$m"); done <<< "$matches"
 
         if [[ ${#arr[@]} -eq 0 ]]; then
-            log_err "No running container matching image '*$DOCKER_IMAGE_MATCH*' found"
-            echo "  Running containers:"
-            docker ps --format '    {{.Names}}  ({{.Image}})'
-            read -rp "  Enter container name to manage (or Ctrl-C to quit): " DOCKER_CONTAINER
+            docker_setup_new_site || exit 1
         elif [[ ${#arr[@]} -eq 1 ]]; then
             DOCKER_CONTAINER="${arr[0]}"
         else
@@ -3340,10 +3665,14 @@ docker_main_menu() {
 # ============================================================
 #  Entry point
 # ============================================================
-parse_args "$@"
-preflight
-if [[ "$SITE_TYPE" == "docker" ]]; then
-    docker_main_menu
-else
-    main_menu
+# Guarded so the script can be sourced as a library (e.g. by the test
+# harness in tests/) without launching the interactive menu.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+    parse_args "$@"
+    preflight
+    if [[ "$SITE_TYPE" == "docker" ]]; then
+        docker_main_menu
+    else
+        main_menu
+    fi
 fi

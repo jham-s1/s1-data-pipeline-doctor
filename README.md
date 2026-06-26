@@ -201,6 +201,7 @@ If your environment uses a corporate proxy, set `HTTPS_PROXY` / `HTTP_PROXY` on 
 
 **Docker sites:**
 - `docker` CLI with access to the daemon (run as root or join the `docker` group)
+- If Docker isn't installed, the tool detects your OS and offers to install Docker Engine for you — Amazon Linux (2 & 2023), Rocky / CentOS Stream / RHEL / AlmaLinux, and Ubuntu / Debian. On macOS or Windows it points you to the matching Docker Desktop installer.
 
 **Both:**
 - `openssl` (TLS verification), `python3` (optional — formatted output, dataplane tap parsing)
