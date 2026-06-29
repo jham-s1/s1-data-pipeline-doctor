@@ -11,3 +11,14 @@ site.yaml
 INCIDENT-REPORT.md
 customer-network-guide.md
 network-requirements.md
+
+# --- Local development artifacts (fork-only; never push upstream) ---
+# AI assistant + planning scratch files
+CLAUDE.md
+PLAN.md
+
+# Docker Desktop / local Docker config & overrides
+.docker/
+docker-compose.override.yml
+docker-compose.*.local.yml
+*.local.yml

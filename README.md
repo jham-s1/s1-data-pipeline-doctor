@@ -108,6 +108,7 @@ A Docker site is a single container (image `observo-standalone-site`) that runs 
 | 10 | **Tail sources & destinations** | Live `dataplane tap` — lists Sources, Egress, and (collapsed) internal sinks + transforms |
 | 11 | **Proxy & connectivity** | Host + in-container egress tests and TLS verification to the site's endpoints |
 | 12 | **Source ports** | Show published ports (annotated by source type) and open a new one for a source — generates the `-p` mapping + recreate command (or recreates for you), plus firewall hints |
+| 13 | **Syslog tester** | Send a synthetic syslog event (Firewall, Auth, DNS, Web, or Generic) to a published source port on `localhost`. Embeds a unique UUID so you can locate the event in SDL with `message contains '<uuid>'` |
 | 0 | **Exit** | |
 
 ### Opening source ports
