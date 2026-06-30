@@ -372,7 +372,7 @@ main_menu() {
             11) menu_change_namespace ;;
             12) menu_dataplane_tap ;;
             13) menu_proxy_connectivity ;;
-            0)  echo ""; log_info "Goodbye."; echo ""; exit 0 ;;
+            0)  echo ""; log_info "Goodbye."; exit 0 ;;
             *)  ;;
         esac
     done
@@ -3720,11 +3720,10 @@ docker_menu_source_ports() {
     esac
 }
 
-docker_menu_syslog_test() {
-    banner
-    echo -e "  ${BOLD}Syslog Tester — $DOCKER_CONTAINER${NC}"
-    echo ""
-
+# Pick a syslog-capable published port for the current container.
+# Sets DP_SYSLOG_PORT and DP_SYSLOG_PROTO on success; returns 1 on cancel / none found.
+# Auto-selects when only one candidate, otherwise offers a menu.
+_dp_pick_syslog_port() {
     # Collect syslog-capable published ports (skip HEC push and Kafka which have dedicated ports).
     local entries=() hports=() protos=() hip hport cport role label
     while IFS='|' read -r hip hport cport; do
@@ -3746,25 +3745,34 @@ docker_menu_syslog_test() {
     if [[ ${#entries[@]} -eq 0 ]]; then
         log_warn "No syslog-capable published ports found."
         echo -e "  ${DIM}Use option 12 — Source ports to publish one first.${NC}"
-        pause; return
+        pause; return 1
     fi
 
-    # Pick the target port — auto-select if only one candidate, otherwise offer a menu.
-    local port proto
     if [[ ${#entries[@]} -eq 1 ]]; then
-        port="${hports[0]}"; proto="${protos[0]}"
-        log_info "Using the only available port: host ${port} (${proto})"
+        DP_SYSLOG_PORT="${hports[0]}"; DP_SYSLOG_PROTO="${protos[0]}"
+        log_info "Using the only available port: host ${DP_SYSLOG_PORT} (${DP_SYSLOG_PROTO})"
         echo ""
-    else
-        local port_count="${#entries[@]}" port_choice
-        entries+=("Back")
-        port_choice=$(pick_one "Which port to send to?" "${entries[@]}")
-        if [[ ! "$port_choice" =~ ^[0-9]+$ || "$port_choice" -gt "$port_count" || "$port_choice" -lt 1 ]]; then
-            return
-        fi
-        port="${hports[$(( port_choice - 1 ))]}"
-        proto="${protos[$(( port_choice - 1 ))]}"
+        return 0
     fi
+
+    local port_count="${#entries[@]}" port_choice
+    entries+=("Back")
+    port_choice=$(pick_one "Which port to send to?" "${entries[@]}")
+    if [[ ! "$port_choice" =~ ^[0-9]+$ || "$port_choice" -gt "$port_count" || "$port_choice" -lt 1 ]]; then
+        return 1
+    fi
+    DP_SYSLOG_PORT="${hports[$(( port_choice - 1 ))]}"
+    DP_SYSLOG_PROTO="${protos[$(( port_choice - 1 ))]}"
+    return 0
+}
+
+docker_menu_syslog_test() {
+    banner
+    echo -e "  ${BOLD}Syslog Tester — $DOCKER_CONTAINER${NC}"
+    echo ""
+
+    _dp_pick_syslog_port || return
+    local port="$DP_SYSLOG_PORT" proto="$DP_SYSLOG_PROTO"
 
     # Pick event category.
     local cat_choice cat
@@ -3807,6 +3815,87 @@ docker_menu_syslog_test() {
     pause
 }
 
+# Continuous generator: send a fresh syslog event every N seconds until Ctrl-C.
+# A log preview / dataplane tap is a LIVE sampler — it only shows lines that flow
+# through the component during its ~30s capture window. A steady trickle keeps the
+# source non-idle so previews always have data to sample, instead of racing one-shot sends.
+docker_menu_syslog_stream() {
+    banner
+    echo -e "  ${BOLD}Syslog Stream (continuous) — $DOCKER_CONTAINER${NC}"
+    echo ""
+
+    _dp_pick_syslog_port || return
+    local port="$DP_SYSLOG_PORT" proto="$DP_SYSLOG_PROTO"
+
+    # Pick event category.
+    local cat_choice cat
+    cat_choice=$(pick_one "Which event type?" \
+        "Firewall (fw)" \
+        "Authentication (auth)" \
+        "DNS (dns)" \
+        "Web (web)" \
+        "Generic" \
+        "Back")
+    case "$cat_choice" in
+        1) cat="fw" ;;
+        2) cat="auth" ;;
+        3) cat="dns" ;;
+        4) cat="web" ;;
+        5) cat="generic" ;;
+        *) return ;;
+    esac
+
+    # Interval between events (default 1s).
+    local rate
+    read -rp "  Seconds between events [1]: " rate
+    [[ -z "$rate" ]] && rate=1
+    if [[ ! "$rate" =~ ^[0-9]+$ ]] || [[ "$rate" -lt 1 ]]; then
+        log_warn "Invalid interval — using 1 second."
+        rate=1
+    fi
+
+    # One UUID for the whole stream run, so every event in this batch shares a
+    # single test-id — search 'message contains <UUID>' to find them all at once.
+    local UUID
+    UUID="$(_dp_gen_uuid)"
+
+    echo ""
+    log_info "Streaming ${cat} events to localhost:${port}/${proto} every ${rate}s."
+    echo -e "  ${DIM}Open a log preview / Tail (option 10) in the Observo UI now — press Ctrl-C to stop.${NC}"
+    echo -e "  ${DIM}Find this batch in SDL Event ALL Search: message contains '${UUID}'${NC}"
+    echo ""
+
+    # Trap SIGINT locally so Ctrl-C stops the loop and returns to the menu
+    # (instead of killing the whole script); restored on exit.
+    local sent=0 fails=0 stop=0 event
+    trap 'stop=1' INT
+    while [[ "$stop" -eq 0 ]]; do
+        event="$(_dp_syslog_event "$cat" "$UUID")"
+        if _dp_send_syslog "$event" "$port" "$proto" >/dev/null 2>&1; then
+            sent=$(( sent + 1 ))
+        else
+            fails=$(( fails + 1 ))
+        fi
+        printf "\r  ${DIM}sent %d   failed %d${NC}   " "$sent" "$fails"
+        [[ "$stop" -eq 1 ]] && break
+        sleep "$rate"
+    done
+    trap - INT
+
+    echo ""
+    echo ""
+    if [[ "$sent" -gt 0 ]]; then
+        if [[ "$fails" -gt 0 ]]; then
+            log_ok "Stream stopped — ${sent} event(s) sent, ${fails} failed."
+        else
+            log_ok "Stream stopped — ${sent} event(s) sent."
+        fi
+    else
+        log_err "Stream stopped — no events sent (${fails} failed). Check the port is published and a listener is up."
+    fi
+    pause
+}
+
 docker_main_menu() {
     while true; do
         banner
@@ -3825,14 +3914,14 @@ docker_main_menu() {
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 7 "Logs (combined/service)" 8 "Service debugger"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 9 "Restart service/container" 10 "Tail sources & destinations"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 11 "Proxy & connectivity" 12 "Source ports"
-        printf "    ${CYAN}%2s)${NC} %s\n" 13 "Syslog tester"
+        printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 13 "Syslog tester" 14 "Syslog stream (continuous)"
         echo ""
         hr
         echo ""
         echo -e "    ${CYAN} 0)${NC} Exit"
         echo ""
         local choice
-        read -rp "  Choose [0-13]: " choice
+        read -rp "  Choose [0-14]: " choice
         case "$choice" in
             1)  docker_full_scan ;;
             2)  docker_run_scan docker_scan_services "Service Health (s6)" ;;
@@ -3847,7 +3936,8 @@ docker_main_menu() {
             11) docker_menu_proxy_connectivity ;;
             12) docker_menu_source_ports ;;
             13) docker_menu_syslog_test ;;
-            0)  echo ""; log_info "Goodbye."; echo ""; exit 0 ;;
+            14) docker_menu_syslog_stream ;;
+            0)  echo ""; log_info "Goodbye."; exit 0 ;;
             *)  ;;
         esac
     done
