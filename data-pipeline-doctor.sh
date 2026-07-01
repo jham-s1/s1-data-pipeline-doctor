@@ -54,6 +54,107 @@ dk_env() {
         | grep "^${1}=" | head -1 | cut -d= -f2-
 }
 
+# Generate a UUID for tagging a test event. Falls back across common sources.
+# BSD logger lacks -n/-P/-T; GNU util-linux logger supports network targets.
+_dp_gen_uuid() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr 'A-Z' 'a-z'
+    elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+        cat /proc/sys/kernel/random/uuid
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import uuid; print(uuid.uuid4())'
+    else
+        printf 'dpd-%s-%s\n' "$(date +%s)" "$RANDOM$RANDOM"
+    fi
+}
+
+# Build an RFC3164 syslog line for a category, with uuid embedded in the message body.
+# $1 = category key (fw|auth|dns|web|generic)   $2 = uuid
+# IPs use TEST-NET (RFC 5737) so events are obviously synthetic.
+# Returns "num_pri|logger_pri_name|tag|body" for a syslog test event.
+# Keeping the PRI numeric and name separate lets the logger path use native flags
+# (no double-encoding) while the nc path builds its own RFC3164 header.
+# IPs use TEST-NET (RFC 5737) so events are obviously synthetic.
+_dp_syslog_event() {
+    local cat="$1" uuid="$2"
+    case "$cat" in
+        fw)   printf '134|local0.info|firewall|action=DENY proto=TCP src=203.0.113.10 dst=198.51.100.5 dpt=443 test-id=%s' "$uuid" ;;
+        auth) printf '38|auth.info|sshd[4242]|Failed password for invalid user admin from 203.0.113.10 port 52311 ssh2 test-id=%s' "$uuid" ;;
+        dns)  printf '142|local1.info|named[990]|query: example.test IN A from 203.0.113.10 test-id=%s' "$uuid" ;;
+        web)  printf '134|local0.info|nginx|203.0.113.10 - - "GET /healthz HTTP/1.1" 200 12 test-id=%s' "$uuid" ;;
+        *)    printf '134|local0.info|dpd-syslog-test|synthetic test event test-id=%s' "$uuid" ;;
+    esac
+}
+
+# Send a syslog test event to localhost:<port>.
+# $1 = event string from _dp_syslog_event ("num_pri|logger_pri|tag|body")
+# $2 = port   $3 = proto (tcp|udp)
+#
+# Sender priority:
+#   1. GNU logger — Linux (util-linux); uses -p/-t so logger owns the RFC3164 header (no double-encoding)
+#   2. Host nc — builds its own RFC3164 packet from the event parts
+#   3. docker run ghcr.io/sva-s1/alpine-nc:main — macOS dev fallback
+#
+# DPD_OS_FAMILY is set by _dpd_detect_os at startup; "mac" skips the GNU logger attempt.
+_dp_send_syslog() {
+    local event="$1" port="$2" proto="$3" rc
+    local num_pri pri_name tag body
+    IFS='|' read -r num_pri pri_name tag body <<< "$event"
+
+    # 1. GNU logger (Linux only — BSD logger on macOS lacks -n/-P/-T)
+    if [[ "${DPD_OS_FAMILY:-}" != "mac" ]] && \
+       command -v logger >/dev/null 2>&1 && \
+       logger --help 2>&1 | grep -q -- '-P'; then
+        if [[ "$proto" == "udp" ]]; then
+            logger -n localhost -P "$port" -d --rfc3164 -p "$pri_name" -t "$tag" -- "$body"
+        else
+            logger -n localhost -P "$port" -T --rfc3164 -p "$pri_name" -t "$tag" -- "$body"
+        fi
+        rc=$?
+        [[ $rc -eq 0 ]] && return 0
+        log_err "logger exited $rc — check that the port is published and a listener is up."
+        return 1
+    fi
+
+    # nc and docker paths send a raw RFC3164 packet built here.
+    local ts rfc_host raw_pkt
+    ts="$(date '+%b %e %H:%M:%S')"
+    rfc_host="$(hostname 2>/dev/null || echo dpd-tester)"
+    raw_pkt="$(printf '<%s>%s %s %s: %s' "$num_pri" "$ts" "$rfc_host" "$tag" "$body")"
+
+    # 2. Host nc
+    if command -v nc >/dev/null 2>&1; then
+        if [[ "$proto" == "udp" ]]; then
+            printf '%s'   "$raw_pkt" | nc -u -w1 localhost "$port"
+        else
+            printf '%s\n' "$raw_pkt" | nc    -w1 localhost "$port"
+        fi
+        rc=$?
+        [[ $rc -eq 0 ]] && return 0
+        log_err "nc exited $rc — check that the port is published and a listener is up on localhost:${port}."
+        return 1
+    fi
+
+    # 3. Docker alpine-nc (macOS dev fallback — requires Docker Desktop)
+    if command -v docker >/dev/null 2>&1; then
+        log_info "No host nc found — using ghcr.io/sva-s1/alpine-nc:main via Docker..."
+        if [[ "$proto" == "udp" ]]; then
+            printf '%s'   "$raw_pkt" | docker run --rm -i --network host \
+                ghcr.io/sva-s1/alpine-nc:main nc -u -w1 localhost "$port"
+        else
+            printf '%s\n' "$raw_pkt" | docker run --rm -i --network host \
+                ghcr.io/sva-s1/alpine-nc:main nc -w1 localhost "$port"
+        fi
+        rc=$?
+        [[ $rc -eq 0 ]] && return 0
+        log_err "docker alpine-nc exited $rc — check that the port is reachable on localhost:${port}."
+        return 1
+    fi
+
+    log_err "No sender available: install nc (or ensure Docker is running for the macOS fallback)."
+    return 1
+}
+
 # List s6 service names into DOCKER_SVCS (cached). Empty => "unknown", not healthy.
 svc_list() {
     if [[ ${#DOCKER_SVCS[@]} -gt 0 ]]; then
@@ -200,6 +301,7 @@ choose_site_type() {
 # ============================================================
 preflight() {
     splash
+    _dpd_detect_os   # sets DPD_OS_FAMILY early — reusable by all menus (e.g. syslog tester sender)
     choose_site_type
     if [[ "$SITE_TYPE" == "docker" ]]; then
         docker_preflight
@@ -3538,7 +3640,7 @@ docker_menu_source_ports() {
     # Choose a preset (prefills proto + suggested port) or custom.
     local choice
     choice=$(pick_one "Add a port for which source type?" \
-        "Syslog TCP" "Syslog TLS" "Syslog UDP" "HEC push" "Kafka" "Custom")
+        "Syslog TCP" "Syslog TLS" "Syslog UDP" "HEC push" "Kafka" "Custom" "Back")
     local proto sugg
     case "$choice" in
         1) proto=tcp; sugg=1514 ;;
@@ -3618,6 +3720,182 @@ docker_menu_source_ports() {
     esac
 }
 
+# Pick a syslog-capable published port for the current container.
+# Sets DP_SYSLOG_PORT and DP_SYSLOG_PROTO on success; returns 1 on cancel / none found.
+# Auto-selects when only one candidate, otherwise offers a menu.
+_dp_pick_syslog_port() {
+    # Collect syslog-capable published ports (skip HEC push and Kafka which have dedicated ports).
+    local entries=() hports=() protos=() hip hport cport role label
+    while IFS='|' read -r hip hport cport; do
+        [[ -z "$cport" ]] && continue
+        role="$(_dp_port_role "$cport" "$hport")"
+        case "$role" in
+            "HEC push"|"Kafka") continue ;;
+        esac
+        if [[ "$role" == Syslog* ]]; then
+            label="host ${hport} → container ${cport}  (${role})"
+        else
+            label="host ${hport} → container ${cport}  (custom)"
+        fi
+        entries+=("$label")
+        hports+=("$hport")
+        protos+=("${cport##*/}")
+    done < <(dinspect '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostIp}}|{{.HostPort}}|{{$p}}{{println}}{{end}}{{end}}')
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        log_warn "No syslog-capable published ports found."
+        echo -e "  ${DIM}Use option 12 — Source ports to publish one first.${NC}"
+        pause; return 1
+    fi
+
+    if [[ ${#entries[@]} -eq 1 ]]; then
+        DP_SYSLOG_PORT="${hports[0]}"; DP_SYSLOG_PROTO="${protos[0]}"
+        log_info "Using the only available port: host ${DP_SYSLOG_PORT} (${DP_SYSLOG_PROTO})"
+        echo ""
+        return 0
+    fi
+
+    local port_count="${#entries[@]}" port_choice
+    entries+=("Back")
+    port_choice=$(pick_one "Which port to send to?" "${entries[@]}")
+    if [[ ! "$port_choice" =~ ^[0-9]+$ || "$port_choice" -gt "$port_count" || "$port_choice" -lt 1 ]]; then
+        return 1
+    fi
+    DP_SYSLOG_PORT="${hports[$(( port_choice - 1 ))]}"
+    DP_SYSLOG_PROTO="${protos[$(( port_choice - 1 ))]}"
+    return 0
+}
+
+docker_menu_syslog_test() {
+    banner
+    echo -e "  ${BOLD}Syslog Tester — $DOCKER_CONTAINER${NC}"
+    echo ""
+
+    _dp_pick_syslog_port || return
+    local port="$DP_SYSLOG_PORT" proto="$DP_SYSLOG_PROTO"
+
+    # Pick event category.
+    local cat_choice cat
+    cat_choice=$(pick_one "Which event type?" \
+        "Firewall (fw)" \
+        "Authentication (auth)" \
+        "DNS (dns)" \
+        "Web (web)" \
+        "Generic" \
+        "Back")
+    case "$cat_choice" in
+        1) cat="fw" ;;
+        2) cat="auth" ;;
+        3) cat="dns" ;;
+        4) cat="web" ;;
+        5) cat="generic" ;;
+        *) return ;;
+    esac
+
+    # Generate UUID, build and send the event.
+    local UUID event body_preview
+    UUID="$(_dp_gen_uuid)"
+    event="$(_dp_syslog_event "$cat" "$UUID")"
+    body_preview="${event##*|}"
+
+    echo ""
+    log_info "Sending to localhost:${port}/${proto}"
+    echo -e "  ${DIM}${body_preview}${NC}"
+    echo ""
+
+    if _dp_send_syslog "$event" "$port" "$proto"; then
+        log_ok "Test event sent."
+        echo -e "  ${DIM}Watch it arrive: Docker menu option 10 — Tail sources & destinations.${NC}"
+        echo ""
+        echo "Use the following in SDL Event ALL Search to locate the test event: message contains '${UUID}'"
+        echo ""
+    else
+        log_err "Failed to send test event — check that the port is published and a listener is up."
+    fi
+    pause
+}
+
+# Continuous generator: send a fresh syslog event every N seconds until Ctrl-C.
+# A log preview / dataplane tap is a LIVE sampler — it only shows lines that flow
+# through the component during its ~30s capture window. A steady trickle keeps the
+# source non-idle so previews always have data to sample, instead of racing one-shot sends.
+docker_menu_syslog_stream() {
+    banner
+    echo -e "  ${BOLD}Syslog Stream (continuous) — $DOCKER_CONTAINER${NC}"
+    echo ""
+
+    _dp_pick_syslog_port || return
+    local port="$DP_SYSLOG_PORT" proto="$DP_SYSLOG_PROTO"
+
+    # Pick event category.
+    local cat_choice cat
+    cat_choice=$(pick_one "Which event type?" \
+        "Firewall (fw)" \
+        "Authentication (auth)" \
+        "DNS (dns)" \
+        "Web (web)" \
+        "Generic" \
+        "Back")
+    case "$cat_choice" in
+        1) cat="fw" ;;
+        2) cat="auth" ;;
+        3) cat="dns" ;;
+        4) cat="web" ;;
+        5) cat="generic" ;;
+        *) return ;;
+    esac
+
+    # Interval between events (default 1s).
+    local rate
+    read -rp "  Seconds between events [1]: " rate
+    [[ -z "$rate" ]] && rate=1
+    if [[ ! "$rate" =~ ^[0-9]+$ ]] || [[ "$rate" -lt 1 ]]; then
+        log_warn "Invalid interval — using 1 second."
+        rate=1
+    fi
+
+    # One UUID for the whole stream run, so every event in this batch shares a
+    # single test-id — search 'message contains <UUID>' to find them all at once.
+    local UUID
+    UUID="$(_dp_gen_uuid)"
+
+    echo ""
+    log_info "Streaming ${cat} events to localhost:${port}/${proto} every ${rate}s."
+    echo -e "  ${DIM}Open a log preview / Tail (option 10) in the Observo UI now — press Ctrl-C to stop.${NC}"
+    echo -e "  ${DIM}Find this batch in SDL Event ALL Search: message contains '${UUID}'${NC}"
+    echo ""
+
+    # Trap SIGINT locally so Ctrl-C stops the loop and returns to the menu
+    # (instead of killing the whole script); restored on exit.
+    local sent=0 fails=0 stop=0 event
+    trap 'stop=1' INT
+    while [[ "$stop" -eq 0 ]]; do
+        event="$(_dp_syslog_event "$cat" "$UUID")"
+        if _dp_send_syslog "$event" "$port" "$proto" >/dev/null 2>&1; then
+            sent=$(( sent + 1 ))
+        else
+            fails=$(( fails + 1 ))
+        fi
+        printf "\r  ${DIM}sent %d   failed %d${NC}   " "$sent" "$fails"
+        [[ "$stop" -eq 1 ]] && break
+        sleep "$rate"
+    done
+    trap - INT
+
+    echo ""
+    echo ""
+    if [[ "$sent" -gt 0 ]]; then
+        if [[ "$fails" -gt 0 ]]; then
+            log_ok "Stream stopped — ${sent} event(s) sent, ${fails} failed."
+        else
+            log_ok "Stream stopped — ${sent} event(s) sent."
+        fi
+    else
+        log_err "Stream stopped — no events sent (${fails} failed). Check the port is published and a listener is up."
+    fi
+    pause
+}
+
 docker_main_menu() {
     while true; do
         banner
@@ -3636,13 +3914,14 @@ docker_main_menu() {
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 7 "Logs (combined/service)" 8 "Service debugger"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 9 "Restart service/container" 10 "Tail sources & destinations"
         printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 11 "Proxy & connectivity" 12 "Source ports"
+        printf "    ${CYAN}%2s)${NC} %-30s ${CYAN}%2s)${NC} %s\n" 13 "Syslog tester" 14 "Syslog stream (continuous)"
         echo ""
         hr
         echo ""
         echo -e "    ${CYAN} 0)${NC} Exit"
         echo ""
         local choice
-        read -rp "  Choose [0-12]: " choice
+        read -rp "  Choose [0-14]: " choice
         case "$choice" in
             1)  docker_full_scan ;;
             2)  docker_run_scan docker_scan_services "Service Health (s6)" ;;
@@ -3656,6 +3935,8 @@ docker_main_menu() {
             10) docker_menu_dataplane_tap ;;
             11) docker_menu_proxy_connectivity ;;
             12) docker_menu_source_ports ;;
+            13) docker_menu_syslog_test ;;
+            14) docker_menu_syslog_stream ;;
             0)  echo ""; log_info "Goodbye."; exit 0 ;;
             *)  ;;
         esac
