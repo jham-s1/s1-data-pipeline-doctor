@@ -96,6 +96,26 @@ _dp_syslog_event() {
 #   3. docker run ghcr.io/sva-s1/alpine-nc:main — macOS dev fallback
 #
 # DPD_OS_FAMILY is set by _dpd_detect_os at startup; "mac" skips the GNU logger attempt.
+# Run a command with a hard wall-clock timeout so a sender that never
+# returns (e.g. BusyBox nc's UDP -w, which doesn't always honor the flag)
+# can't hang the interactive menu.
+_dp_timeout() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$secs" "$@"
+    else
+        "$@" &
+        local pid=$! rc watcher
+        ( sleep "$secs" 2>/dev/null; kill -9 "$pid" 2>/dev/null ) &
+        watcher=$!
+        wait "$pid" 2>/dev/null; rc=$?
+        kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null
+        return $rc
+    fi
+}
+
 _dp_send_syslog() {
     local event="$1" port="$2" proto="$3" rc
     local num_pri pri_name tag body
@@ -111,23 +131,28 @@ _dp_send_syslog() {
             logger -n localhost -P "$port" -T --rfc3164 -p "$pri_name" -t "$tag" -- "$body"
         fi
         rc=$?
-        [[ $rc -eq 0 ]] && return 0
-        log_err "logger exited $rc — check that the port is published and a listener is up."
-        return 1
+        if [[ $rc -eq 0 ]]; then
+            return 0
+        fi
+        # -P support doesn't guarantee --rfc3164/-T support (older util-linux,
+        # e.g. RHEL 7) — don't blame the port, just fall through to nc.
+        log_warn "logger exited $rc (may not support --rfc3164/-T on this util-linux version) — falling back to nc."
     fi
 
     # nc and docker paths send a raw RFC3164 packet built here.
+    # Force C locale — a localized month name here (e.g. from LC_TIME) would
+    # produce a malformed RFC3164 timestamp.
     local ts rfc_host raw_pkt
-    ts="$(date '+%b %e %H:%M:%S')"
+    ts="$(LC_ALL=C date '+%b %e %H:%M:%S')"
     rfc_host="$(hostname 2>/dev/null || echo dpd-tester)"
     raw_pkt="$(printf '<%s>%s %s %s: %s' "$num_pri" "$ts" "$rfc_host" "$tag" "$body")"
 
-    # 2. Host nc
+    # 2. Host nc (hard-timeout guards against BusyBox nc's unreliable -w on UDP)
     if command -v nc >/dev/null 2>&1; then
         if [[ "$proto" == "udp" ]]; then
-            printf '%s'   "$raw_pkt" | nc -u -w1 localhost "$port"
+            printf '%s'   "$raw_pkt" | _dp_timeout 5 nc -u -w1 localhost "$port"
         else
-            printf '%s\n' "$raw_pkt" | nc    -w1 localhost "$port"
+            printf '%s\n' "$raw_pkt" | _dp_timeout 5 nc    -w1 localhost "$port"
         fi
         rc=$?
         [[ $rc -eq 0 ]] && return 0
@@ -138,16 +163,33 @@ _dp_send_syslog() {
     # 3. Docker alpine-nc (macOS dev fallback — requires Docker Desktop)
     if command -v docker >/dev/null 2>&1; then
         log_info "No host nc found — using ghcr.io/sva-s1/alpine-nc:main via Docker..."
+
+        # Pull explicitly first so a registry-unreachable/offline host gets a
+        # clear message instead of a generic "port not reachable" — the nc
+        # step below would otherwise fail the same way and mislead the user.
+        if ! docker image inspect ghcr.io/sva-s1/alpine-nc:main >/dev/null 2>&1; then
+            if ! docker pull ghcr.io/sva-s1/alpine-nc:main >/dev/null 2>&1; then
+                log_err "Could not pull ghcr.io/sva-s1/alpine-nc:main — this host looks offline or air-gapped (registry unreachable), not a port problem. No fallback sender is available; install nc locally to test without internet access."
+                return 1
+            fi
+        fi
+
+        # --network host is a no-op on Docker Desktop for Mac (it runs in a
+        # VM), so "localhost" inside the container isn't the Mac's localhost.
+        # Use Docker Desktop's host.docker.internal alias there instead.
+        local dp_docker_target="localhost"
+        [[ "${DPD_OS_FAMILY:-}" == "mac" ]] && dp_docker_target="host.docker.internal"
+
         if [[ "$proto" == "udp" ]]; then
-            printf '%s'   "$raw_pkt" | docker run --rm -i --network host \
-                ghcr.io/sva-s1/alpine-nc:main nc -u -w1 localhost "$port"
+            printf '%s'   "$raw_pkt" | _dp_timeout 5 docker run --rm -i --network host \
+                ghcr.io/sva-s1/alpine-nc:main nc -u -w1 "$dp_docker_target" "$port"
         else
-            printf '%s\n' "$raw_pkt" | docker run --rm -i --network host \
-                ghcr.io/sva-s1/alpine-nc:main nc -w1 localhost "$port"
+            printf '%s\n' "$raw_pkt" | _dp_timeout 5 docker run --rm -i --network host \
+                ghcr.io/sva-s1/alpine-nc:main nc -w1 "$dp_docker_target" "$port"
         fi
         rc=$?
         [[ $rc -eq 0 ]] && return 0
-        log_err "docker alpine-nc exited $rc — check that the port is reachable on localhost:${port}."
+        log_err "docker alpine-nc exited $rc — check that the port is reachable on ${dp_docker_target}:${port}."
         return 1
     fi
 
@@ -2348,15 +2390,17 @@ docker_setup_new_site() {
     # Step 4: Run container
     echo "  Step 4 — Starting the Data Pipeline container..."
     local docker_flags=()
-    for spec in "${port_specs[@]}"; do
-        docker_flags+=("-p" "$spec")
-    done
+    if [[ ${#port_specs[@]} -gt 0 ]]; then
+        for spec in "${port_specs[@]}"; do
+            docker_flags+=("-p" "$spec")
+        done
+    fi
     if docker run -d \
         --name observo-standalone-site \
         --env-file "$env_file" \
         --tmpfs /etc/secrets:uid=1000,gid=1000,mode=0700 \
         -v observo-data:/var/observo/data \
-        "${docker_flags[@]}" \
+        "${docker_flags[@]+"${docker_flags[@]}"}" \
         "$image" >/dev/null 2>&1; then
         log_ok "Container started: observo-standalone-site"
     else
