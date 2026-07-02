@@ -2387,30 +2387,21 @@ docker_setup_new_site() {
     fi
     echo
 
-    # Step 4: Run container
-    echo "  Step 4 — Starting the Data Pipeline container..."
-    local docker_flags=()
-    if [[ ${#port_specs[@]} -gt 0 ]]; then
-        for spec in "${port_specs[@]}"; do
-            docker_flags+=("-p" "$spec")
-        done
-    fi
-    if docker run -d \
-        --name observo-standalone-site \
-        --env-file "$env_file" \
-        --tmpfs /etc/secrets:uid=1000,gid=1000,mode=0700 \
-        -v observo-data:/var/observo/data \
-        "${docker_flags[@]+"${docker_flags[@]}"}" \
-        "$image" >/dev/null 2>&1; then
-        log_ok "Container started: observo-standalone-site"
-    else
-        log_err "Failed to start container. Check: docker logs observo-standalone-site"
-        return 1
+    # Step 4: Docker Compose or plain `docker run`? Ask before starting
+    # anything — deciding after the container is already running (the old
+    # behavior) left a docker-run container and an unused compose file
+    # both claiming the same container name, so `docker compose up -d`
+    # would then collide with it.
+    echo "  Step 4 — How do you want to manage this site?"
+    local use_compose=false
+    if confirm "Use Docker Compose (recommended — easier to manage/update)?"; then
+        use_compose=true
     fi
     echo
 
-    # Step 5: Offer Docker Compose
-    if confirm "Create a docker-compose.yml for easier management?"; then
+    # Step 5: Start the container
+    echo "  Step 5 — Starting the Data Pipeline container..."
+    if $use_compose; then
         local compose_file="$HOME/docker-compose-observo.yml"
         cat > "$compose_file" <<COMPOSE
 services:
@@ -2436,7 +2427,37 @@ volumes:
   observo-data:
 COMPOSE
         log_ok "Created: $compose_file"
-        echo -e "          Run with: ${CYAN}docker compose -f $compose_file up -d${NC}"
+
+        if ! docker compose version >/dev/null 2>&1; then
+            log_err "docker compose (v2 plugin) not found — install it, then run: docker compose -f $compose_file up -d"
+            return 1
+        fi
+        if docker compose -f "$compose_file" up -d >/dev/null 2>&1; then
+            log_ok "Container started via Docker Compose: observo-standalone-site"
+            echo -e "          Manage with: ${CYAN}docker compose -f $compose_file [up -d|down|logs|restart]${NC}"
+        else
+            log_err "docker compose up failed. Check: docker compose -f $compose_file logs"
+            return 1
+        fi
+    else
+        local docker_flags=()
+        if [[ ${#port_specs[@]} -gt 0 ]]; then
+            for spec in "${port_specs[@]}"; do
+                docker_flags+=("-p" "$spec")
+            done
+        fi
+        if docker run -d \
+            --name observo-standalone-site \
+            --env-file "$env_file" \
+            --tmpfs /etc/secrets:uid=1000,gid=1000,mode=0700 \
+            -v observo-data:/var/observo/data \
+            "${docker_flags[@]+"${docker_flags[@]}"}" \
+            "$image" >/dev/null 2>&1; then
+            log_ok "Container started: observo-standalone-site"
+        else
+            log_err "Failed to start container. Check: docker logs observo-standalone-site"
+            return 1
+        fi
     fi
     echo
 
