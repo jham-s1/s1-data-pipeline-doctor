@@ -42,6 +42,20 @@ log_fix()   { echo -e "${GREEN}[FIX ]${NC}  $*"; }
 
 kc() { kubectl ${KUBECONFIG:+--kubeconfig "$KUBECONFIG"} "$@"; }
 
+# True if $1 (a log blob) has a connection-refused/timeout/etc. line that
+# isn't Vector's own internal self-scrape. The prometheus_metrics source
+# scrapes an internal metrics listener on loopback (127.0.0.x); when that
+# listener isn't up, Vector logs the exact same connection-refused/timeout
+# text a real outbound failure to the Data Pipeline control plane would use
+# — sometimes across two log lines (a WARN summary plus an ERROR with the
+# loopback URL), so both the loopback address and the component tag are
+# excluded. Without this, a healthy site that's actively reporting in can
+# still get flagged with a misleading "outbound connection failures" finding.
+_dp_has_outbound_failure() {
+    echo "$1" | grep -iE "connection refused|dial tcp.*timeout|no such host|network is unreachable|connection timed out|i/o timeout" \
+        | grep -qvE "127\.0\.0\.[0-9]+|\[?::1\]?|localhost|component_id=prometheus_metrics|component_type=prometheus_scrape"
+}
+
 # --- Docker primitives (Docker standalone site backend) ---
 dk()        { docker "$@"; }
 dexec()     { docker exec "$DOCKER_CONTAINER" "$@"; }
@@ -590,7 +604,7 @@ scan_container_errors() {
     fi
 
     # Connection failures (proxy/firewall blocking outbound)
-    if echo "$logs" | grep -qiE "connection refused|dial tcp.*timeout|no such host|network is unreachable|connection timed out"; then
+    if _dp_has_outbound_failure "$logs"; then
         log_err "  [$container] Outbound connection failures detected"
         DETECTED_ISSUES+=("connectivity: $pod/$container has outbound connection failures")
     fi
@@ -2029,7 +2043,7 @@ run_all_fixes() {
                     -o jsonpath='{range .status.containerStatuses[*]}{.lastState.terminated.reason}{"\n"}{end}' 2>/dev/null || true)
                 if echo "$oom_check" | grep -q "OOMKilled"; then
                     root_cause="oom"
-                elif echo "$crash_logs" | grep -qiE "connection refused|dial tcp.*timeout|no such host|network is unreachable|connection timed out"; then
+                elif _dp_has_outbound_failure "$crash_logs"; then
                     root_cause="connectivity"
                 elif echo "$crash_logs" | grep -q "certificate signed by unknown authority"; then
                     root_cause="tls"
@@ -2840,7 +2854,7 @@ docker_scan_service_logs() {
         log_err "Auth token malformed"
         add_issue "malformed-token: $DOCKER_CONTAINER bad auth token"; found=true
     fi
-    if echo "$logs" | grep -qiE "connection refused|dial tcp.*timeout|no such host|network is unreachable|connection timed out|i/o timeout"; then
+    if _dp_has_outbound_failure "$logs"; then
         log_err "Outbound connection failures in logs"
         add_issue "connectivity: $DOCKER_CONTAINER has outbound connection failures"; found=true
     fi
