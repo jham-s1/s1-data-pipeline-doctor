@@ -72,6 +72,7 @@ IMAGES=(
     "almalinux:9|rhel|dpd_install_rhel"
     "quay.io/centos/centos:stream9|rhel|dpd_install_rhel"
     "redhat/ubi9:latest|rhel|dpd_install_rhel"
+    "fedora:latest|fedora|dpd_install_fedora"
     "amazonlinux:2|amazon|dpd_install_amazon"
     "amazonlinux:2023|amazon|dpd_install_amazon"
 )

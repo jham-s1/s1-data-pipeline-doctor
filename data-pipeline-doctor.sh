@@ -25,7 +25,7 @@ API_GATEWAY_ENDPOINT_VAL=""                       # manager/gateway endpoint (fr
 PIPELINE_NAME_MAP=()                               # "entityid|Human Name" entries (bash 3.2-safe; no assoc arrays)
 
 # --- Host OS discovery (for the Docker install guide) ---
-DPD_OS_FAMILY=""                                   # mac|windows|wsl|debian|rhel|amazon|unknown
+DPD_OS_FAMILY=""                                   # mac|windows|wsl|debian|rhel|fedora|amazon|unknown
 DPD_OS_ID=""                                       # /etc/os-release ID (ubuntu, rocky, amzn, ...)
 DPD_OS_VER=""                                      # /etc/os-release VERSION_ID
 
@@ -2314,13 +2314,16 @@ docker_setup_new_site() {
     echo "    4. Choose your scope"
     echo "    5. The console will generate a .env file — download it"
     echo
+
+    local user_home; user_home="$(_dpd_home)"
+    local env_file="$user_home/ai-data-pipelines.env"
+
     echo "  Copy that file to:"
-    echo -e "    ${CYAN}~/ai-data-pipelines.env${NC}"
+    echo -e "    ${CYAN}${env_file}${NC}"
     echo
-    echo "  Waiting for ~/ai-data-pipelines.env...  (Ctrl-C to abort)"
+    echo "  Waiting for ${env_file}...  (Ctrl-C to abort)"
     echo
 
-    local env_file="$HOME/ai-data-pipelines.env"
     if [[ ! -f "$env_file" ]]; then
         echo -n "  Checking"
         while [[ ! -f "$env_file" ]]; do
@@ -2328,7 +2331,7 @@ docker_setup_new_site() {
         done
         echo
     fi
-    log_ok "Found ~/ai-data-pipelines.env"
+    log_ok "Found $env_file"
     chmod 600 "$env_file"
     echo
 
@@ -2336,7 +2339,7 @@ docker_setup_new_site() {
     # in a comment line like:   docker login -u AWS -p 'eyJw...' 822434346939.dkr.ecr.us-east-1.amazonaws.com
     local login_line registry token
     login_line=$(grep -m1 'docker login' "$env_file") || {
-        log_err "Could not find 'docker login' line in ~/ai-data-pipelines.env"; return 1
+        log_err "Could not find 'docker login' line in $env_file"; return 1
     }
     registry=$(awk '{print $NF}' <<< "$login_line") || {
         log_err "Could not parse ECR registry from $env_file"; return 1
@@ -2348,7 +2351,7 @@ docker_setup_new_site() {
     # Parse image URI from comment header (looks like: 822434346939.dkr.ecr.us-east-1.amazonaws.com/observo-standalone-site:2.26.3)
     local image
     image=$(grep -oE '[0-9]+\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com/[a-zA-Z0-9/_-]+:[0-9.]+' "$env_file" | head -1) || {
-        log_err "Could not find ECR image URI in ~/ai-data-pipelines.env"; return 1
+        log_err "Could not find ECR image URI in $env_file"; return 1
     }
     echo
 
@@ -2357,7 +2360,7 @@ docker_setup_new_site() {
     if docker login -u AWS --password-stdin "$registry" <<< "$token" >/dev/null 2>&1; then
         log_ok "Registry login successful"
     else
-        log_err "Docker login failed — verify ~/ai-data-pipelines.env is correct"
+        log_err "Docker login failed — verify $env_file is correct"
         return 1
     fi
     echo
@@ -2416,13 +2419,13 @@ docker_setup_new_site() {
     # Step 5: Start the container
     echo "  Step 5 — Starting the Data Pipeline container..."
     if $use_compose; then
-        local compose_file="$HOME/docker-compose-observo.yml"
+        local compose_file="$user_home/docker-compose-observo.yml"
         cat > "$compose_file" <<COMPOSE
 services:
   observo-standalone-site:
     image: $image
     container_name: observo-standalone-site
-    env_file: ~/ai-data-pipelines.env
+    env_file: $env_file
     tmpfs:
       - /etc/secrets:uid=1000,gid=1000,mode=0700
     volumes:
@@ -2517,6 +2520,18 @@ url_to_hostport() {
 
 _dpd_sudo() { [[ ${EUID:-$(id -u)} -eq 0 ]] && echo "" || echo "sudo"; }
 
+# The invoking (non-root) user's home dir, even when this script is run via
+# sudo — where user-facing files like ai-data-pipelines.env actually live.
+# $HOME alone resolves to /root under sudo, not the real login user's home.
+_dpd_home() {
+    local target_user="${SUDO_USER:-}" h
+    if [[ ${EUID:-$(id -u)} -eq 0 && -n "$target_user" && "$target_user" != "root" ]]; then
+        h="$(eval echo "~$target_user" 2>/dev/null)"
+        [[ -n "$h" && "$h" != "~$target_user" && -d "$h" ]] && { echo "$h"; return; }
+    fi
+    echo "$HOME"
+}
+
 # Detect the host OS into DPD_OS_FAMILY / DPD_OS_ID / DPD_OS_VER.
 _dpd_detect_os() {
     DPD_OS_FAMILY=""; DPD_OS_ID=""; DPD_OS_VER=""
@@ -2535,11 +2550,13 @@ _dpd_detect_os() {
             amzn)                         DPD_OS_FAMILY="amazon" ;;
             ubuntu|debian)                DPD_OS_FAMILY="debian" ;;
             rhel|centos|rocky|almalinux)  DPD_OS_FAMILY="rhel" ;;
+            fedora)                       DPD_OS_FAMILY="fedora" ;;
             *)
                 case " ${ID_LIKE:-} " in
-                    *debian*)                  DPD_OS_FAMILY="debian" ;;
-                    *rhel*|*fedora*|*centos*)  DPD_OS_FAMILY="rhel" ;;
-                    *)                         DPD_OS_FAMILY="unknown" ;;
+                    *debian*)   DPD_OS_FAMILY="debian" ;;
+                    *fedora*)   DPD_OS_FAMILY="fedora" ;;
+                    *rhel*|*centos*)  DPD_OS_FAMILY="rhel" ;;
+                    *)          DPD_OS_FAMILY="unknown" ;;
                 esac ;;
         esac
     else
@@ -2588,6 +2605,25 @@ dpd_install_rhel() {
     else
         _dpd_run $SUDO dnf config-manager addrepo --from-repofile \
             https://download.docker.com/linux/centos/docker-ce.repo || return 1
+    fi
+    _dpd_run $SUDO dnf install -y docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin || return 1
+    _dpd_post_install
+}
+
+dpd_install_fedora() {
+    local SUDO
+    SUDO="$(_dpd_sudo)"
+    echo "  Installing Docker Engine from Docker's official dnf repository..."
+    echo
+    _dpd_run $SUDO dnf -y install dnf-plugins-core || return 1
+    # dnf5 (config-manager addrepo) vs dnf4 (config-manager --add-repo)
+    if $SUDO dnf config-manager --help 2>&1 | grep -q -- '--add-repo'; then
+        _dpd_run $SUDO dnf config-manager --add-repo \
+            https://download.docker.com/linux/fedora/docker-ce.repo || return 1
+    else
+        _dpd_run $SUDO dnf config-manager addrepo --from-repofile \
+            https://download.docker.com/linux/fedora/docker-ce.repo || return 1
     fi
     _dpd_run $SUDO dnf install -y docker-ce docker-ce-cli containerd.io \
         docker-buildx-plugin docker-compose-plugin || return 1
@@ -2655,6 +2691,7 @@ docker_install_guide() {
             return 1 ;;
         debian) confirm "Install Docker Engine now (apt)?" && dpd_install_debian ;;
         rhel)   confirm "Install Docker Engine now (dnf)?" && dpd_install_rhel ;;
+        fedora) confirm "Install Docker Engine now (dnf)?" && dpd_install_fedora ;;
         amazon) confirm "Install Docker Engine now?"       && dpd_install_amazon ;;
         *)
             log_err "Could not auto-detect a supported OS for automatic install."
