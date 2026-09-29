@@ -257,7 +257,7 @@ splash() {
     echo " ██║     ██║██║     ███████╗███████╗██║██║ ╚████║███████╗███████║"
     echo " ╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝"
     echo -e "${NC}${BOLD}${CYAN}"
-    echo " ══════════════════════════════════════════   ♥  Doctor v1.5"
+    echo " ══════════════════════════════════════════   ♥  Doctor v1.6"
     echo -e "${NC}${DIM}   Site diagnostics & remediation  ·  K8s + Docker  ·  SentinelOne${NC}"
     echo ""
     read -rp "  Press Enter to begin..." _
@@ -267,7 +267,7 @@ splash() {
 banner() {
     clear
     echo ""
-    echo -e "  ${BOLD}${PURPLE}S1 DATA PIPELINES${NC} ${DIM}·${NC} ${BOLD}${CYAN}Doctor${NC} ${DIM}v1.5${NC}    ${CYAN}♥${NC}"
+    echo -e "  ${BOLD}${PURPLE}S1 DATA PIPELINES${NC} ${DIM}·${NC} ${BOLD}${CYAN}Doctor${NC} ${DIM}v1.6${NC}    ${CYAN}♥${NC}"
     echo -e "  ${DIM}K8s + Docker site diagnostics · Justin.Hamblin@SentinelOne.com${NC}"
     hr
     echo ""
