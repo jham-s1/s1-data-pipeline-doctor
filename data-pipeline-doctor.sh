@@ -257,7 +257,7 @@ splash() {
     echo " ██║     ██║██║     ███████╗███████╗██║██║ ╚████║███████╗███████║"
     echo " ╚═╝     ╚═╝╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝"
     echo -e "${NC}${BOLD}${CYAN}"
-    echo " ══════════════════════════════════════════   ♥  Doctor v1.5"
+    echo " ══════════════════════════════════════════   ♥  Doctor v1.6"
     echo -e "${NC}${DIM}   Site diagnostics & remediation  ·  K8s + Docker  ·  SentinelOne${NC}"
     echo ""
     read -rp "  Press Enter to begin..." _
@@ -267,7 +267,7 @@ splash() {
 banner() {
     clear
     echo ""
-    echo -e "  ${BOLD}${PURPLE}S1 DATA PIPELINES${NC} ${DIM}·${NC} ${BOLD}${CYAN}Doctor${NC} ${DIM}v1.5${NC}    ${CYAN}♥${NC}"
+    echo -e "  ${BOLD}${PURPLE}S1 DATA PIPELINES${NC} ${DIM}·${NC} ${BOLD}${CYAN}Doctor${NC} ${DIM}v1.6${NC}    ${CYAN}♥${NC}"
     echo -e "  ${DIM}K8s + Docker site diagnostics · Justin.Hamblin@SentinelOne.com${NC}"
     hr
     echo ""
@@ -2321,17 +2321,20 @@ docker_setup_new_site() {
     echo "  Copy that file to:"
     echo -e "    ${CYAN}${env_file}${NC}"
     echo
-    echo "  Waiting for ${env_file}...  (Ctrl-C to abort)"
-    echo
 
-    if [[ ! -f "$env_file" ]]; then
+    if [[ -f "$env_file" ]]; then
+        log_ok "Found $env_file"
+    elif confirm "Can't get the file onto this host, or not sure it's in the right place? Paste its contents in directly instead"; then
+        _dpd_paste_env "$env_file" || return 1
+    else
+        echo "  Waiting for ${env_file}...  (Ctrl-C to abort)"
         echo -n "  Checking"
         while [[ ! -f "$env_file" ]]; do
             echo -n "."; sleep 3
         done
         echo
+        log_ok "Found $env_file"
     fi
-    log_ok "Found $env_file"
     chmod 600 "$env_file"
     echo
 
@@ -2530,6 +2533,29 @@ _dpd_home() {
         [[ -n "$h" && "$h" != "~$target_user" && -d "$h" ]] && { echo "$h"; return; }
     fi
     echo "$HOME"
+}
+
+# Prompt for the .env contents directly instead of waiting on a file copy —
+# sidesteps every "wrong home dir / wrong filename / NFS cache / sudo vs
+# root" flavor of "the file isn't where I expect" report.
+_dpd_paste_env() {
+    local target="$1" line
+    echo
+    echo "  Paste the full contents of the downloaded .env file below."
+    echo "  When done, press Enter then Ctrl-D (or type a line with just EOF)."
+    echo
+    : > "$target"
+    while IFS= read -r line; do
+        [[ "$line" == "EOF" ]] && break
+        printf '%s\n' "$line" >> "$target"
+    done
+    if [[ ! -s "$target" ]]; then
+        log_err "No content received — aborting."
+        rm -f "$target"
+        return 1
+    fi
+    chmod 600 "$target"
+    log_ok "Saved pasted .env contents to $target"
 }
 
 # Detect the host OS into DPD_OS_FAMILY / DPD_OS_ID / DPD_OS_VER.
